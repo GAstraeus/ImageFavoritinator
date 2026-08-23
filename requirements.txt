@@ -1,0 +1,4 @@
+pillow>=10.0
+# Optional but strongly recommended for fast CR3 browsing.
+# Without it, the viewer falls back to macOS's built-in `sips` (slower).
+rawpy>=0.19

@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+favorites.txt
+non_favorites.txt
+photoviewer_favorites.json
