@@ -6,6 +6,7 @@ Run manually (opens a hidden window briefly):
 """
 
 import json
+import os
 import sys
 import tempfile
 import time
@@ -88,14 +89,24 @@ def main():
     app.step(1)
     app.toggle_favorite()          # IMG_3 off
     assert store.favorites == set()
-    app.set_filter("all")
+    # Re-pressing the same view key must refresh membership.
     app.set_filter("fav")
     assert app.view == []
     app.render()                   # empty view: message, no crash
     app.step(1)                    # navigation on empty view: no crash
 
-    # Export.
     app.set_filter("all")
+
+    # Save failures must surface in the UI instead of silently losing data.
+    os.chmod(directory, 0o555)
+    app.toggle_favorite()
+    assert app.save_warning is not None
+    assert "NOT SAVED" in app.status.cget("text"), app.status.cget("text")
+    os.chmod(directory, 0o755)
+    app.toggle_favorite()          # save works again -> warning clears
+    assert app.save_warning is None
+
+    # Export.
     app.toggle_favorite()  # star current again so export has content
     app.export_lists()
     favs = (directory / "favorites.txt").read_text().split()

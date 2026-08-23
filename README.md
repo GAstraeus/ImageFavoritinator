@@ -48,7 +48,9 @@ The intended workflow for culling thousands of shots:
 1. First pass: `python3 photo_viewer.py /photos` — arrow through everything,
    press `Space` on keepers.
 2. Second pass: press `2` (or launch with `--filter fav`) to see only your
-   favorites, and press `Space` again to demote the weaker ones.
+   favorites, and press `Space` again to demote the weaker ones. A demoted
+   image stays visible (so you can change your mind); press `2` again to
+   refresh the view and drop the demoted ones.
 3. Repeat until the favorites view is your final selection, then press `E` to
    write `favorites.txt` / `non_favorites.txt`.
 

@@ -1,6 +1,7 @@
 """Unit tests for the non-GUI logic in photo_viewer.py."""
 
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -81,6 +82,29 @@ class TestFavoritesStore(unittest.TestCase):
         (self.dir / "photoviewer_favorites.json").write_text("{not json")
         with self.assertRaises(SystemExit):
             FavoritesStore(self.dir)
+
+    def test_wrong_shape_json_exits_without_clobbering(self):
+        path = self.dir / "photoviewer_favorites.json"
+        for bad in ('{"favorites": "IMG_0001.CR3"}',   # str, not list
+                    '["IMG_0001.CR3"]',                # top-level array
+                    '{"favorites": [1, 2]}'):          # non-string entries
+            path.write_text(bad)
+            with self.assertRaises(SystemExit):
+                FavoritesStore(self.dir)
+            self.assertEqual(path.read_text(), bad)    # file untouched
+
+    @unittest.skipIf(hasattr(os, "geteuid") and os.geteuid() == 0,
+                     "root ignores directory permissions")
+    def test_save_failure_raises_but_keeps_memory_state(self):
+        store = FavoritesStore(self.dir)
+        os.chmod(self.dir, 0o555)
+        try:
+            with self.assertRaises(OSError):
+                store.toggle("IMG_1.CR3")
+            # In-memory change survives so a later successful save keeps it.
+            self.assertIn("IMG_1.CR3", store.favorites)
+        finally:
+            os.chmod(self.dir, 0o755)
 
 
 class TestFiltering(unittest.TestCase):

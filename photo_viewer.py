@@ -149,13 +149,21 @@ class FavoritesStore:
         self.load()
 
     def load(self):
-        if self.path.exists():
-            try:
-                data = json.loads(self.path.read_text(encoding="utf-8"))
-                self.favorites = set(data.get("favorites", []))
-            except (json.JSONDecodeError, OSError) as exc:
-                sys.exit(f"Could not read {self.path}: {exc}\n"
-                         "Fix or move the file and try again.")
+        if not self.path.exists():
+            return
+        try:
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            favs = data.get("favorites", []) if isinstance(data, dict) else None
+            if not isinstance(favs, list) or \
+                    not all(isinstance(name, str) for name in favs):
+                # Never proceed (and later save over) a file whose shape we
+                # don't understand — a hand-edit could otherwise be destroyed.
+                raise ValueError(
+                    'expected {"favorites": ["file1.CR3", "file2.CR3", ...]}')
+            self.favorites = set(favs)
+        except (json.JSONDecodeError, OSError, ValueError) as exc:
+            sys.exit(f"Could not read {self.path}: {exc}\n"
+                     "Fix or move the file and try again.")
 
     def save(self):
         payload = json.dumps({"favorites": sorted(self.favorites)}, indent=2)
@@ -358,6 +366,7 @@ Space or F        toggle favorite
 1                 view all
 2                 view favorites only
 3                 view non-favorites only
+                  (re-press 2/3 to refresh after toggling)
 Home / End        first / last image
 E                 export favorites.txt / non_favorites.txt
 G                 toggle fullscreen
@@ -385,6 +394,7 @@ class ViewerApp:
         self._resize_job = None
         self._flash_text = None
         self._flash_job = None
+        self.save_warning = None    # persistent banner when saving fails
 
         root.title(f"PhotoViewer — {self.directory}")
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -463,14 +473,25 @@ class ViewerApp:
         current = self.current_file()
         if current is None:
             return
-        now_fav = self.store.toggle(rel_name(current, self.directory))
+        name = rel_name(current, self.directory)
+        try:
+            now_fav = self.store.toggle(name)
+            self.save_warning = None    # a successful save persists everything
+        except OSError as exc:
+            # The in-memory toggle already happened; keep it (a later
+            # successful save writes the whole set) but tell the user loudly
+            # instead of letting tkinter swallow the traceback.
+            now_fav = self.store.is_favorite(name)
+            self.save_warning = (f"⚠ FAVORITES NOT SAVED ({exc}) — "
+                                 "fix the folder permissions/disk, then "
+                                 "toggle any favorite to retry")
         self.flash(("★ Favorited" if now_fav else "☆ Removed favorite")
                    + f"  {current.name}")
         self.render()
 
     def set_filter(self, mode):
-        if mode == self.filter_mode:
-            return
+        # No early-return when mode is unchanged: re-pressing the view's key
+        # refreshes membership after favorites were toggled inside the view.
         current = self.current_file()
         self.filter_mode = mode
         self.view = apply_filter(self.all_files, self.store.favorites, mode,
@@ -485,12 +506,16 @@ class ViewerApp:
                               self.directory)
         fav_path = self.directory / "favorites.txt"
         other_path = self.directory / "non_favorites.txt"
-        fav_path.write_text(
-            "\n".join(rel_name(p, self.directory) for p in favs) + "\n",
-            encoding="utf-8")
-        other_path.write_text(
-            "\n".join(rel_name(p, self.directory) for p in others) + "\n",
-            encoding="utf-8")
+        try:
+            fav_path.write_text(
+                "\n".join(rel_name(p, self.directory) for p in favs) + "\n",
+                encoding="utf-8")
+            other_path.write_text(
+                "\n".join(rel_name(p, self.directory) for p in others) + "\n",
+                encoding="utf-8")
+        except OSError as exc:
+            self.flash(f"⚠ Export FAILED: {exc}")
+            return
         self.flash(f"Exported {len(favs)} favorites → favorites.txt, "
                    f"{len(others)} others → non_favorites.txt")
 
@@ -592,7 +617,10 @@ class ViewerApp:
                     f"   ★ {nfav} favorites   (h for help)")
         if self._flash_text:
             text = f"{self._flash_text}   |   {text}"
-        self.status.config(text=text)
+        if self.save_warning:
+            text = f"{self.save_warning}   |   {text}"
+        self.status.config(text=text,
+                           fg="#ff8844" if self.save_warning else "#dddddd")
 
     def flash(self, message):
         # Kept as state (not a one-off config call) so a render() in the same
@@ -628,6 +656,12 @@ class ViewerApp:
             self.quit()
 
     def quit(self):
+        if self.save_warning:
+            try:
+                self.store.save()
+            except OSError as exc:
+                print(f"WARNING: favorites could not be saved to "
+                      f"{self.store.path}: {exc}", file=sys.stderr)
         self.loader.shutdown()
         self.root.destroy()
 
