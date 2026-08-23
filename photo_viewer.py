@@ -38,7 +38,6 @@ import sys
 import tempfile
 import threading
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 try:
@@ -285,7 +284,15 @@ class ImageLoader:
         self._cache = OrderedDict()   # str(path) -> PIL.Image
         self._pending = set()
         self._lock = threading.Lock()
-        self._executor = ThreadPoolExecutor(max_workers=workers)
+        # Daemon threads (not ThreadPoolExecutor): executor workers are
+        # non-daemon and get joined at interpreter exit, so quitting would
+        # block for seconds on an in-flight sips/rawpy decode.
+        self._tasks = queue.Queue()
+        self._workers = []
+        for _ in range(workers):
+            thread = threading.Thread(target=self._worker_loop, daemon=True)
+            thread.start()
+            self._workers.append(thread)
 
     def get_cached(self, path):
         key = str(path)
@@ -302,7 +309,14 @@ class ImageLoader:
             if key in self._cache or key in self._pending:
                 return
             self._pending.add(key)
-        self._executor.submit(self._work, path)
+        self._tasks.put(path)
+
+    def _worker_loop(self):
+        while True:
+            path = self._tasks.get()
+            if path is None:
+                return
+            self._work(path)
 
     def _work(self, path):
         key = str(path)
@@ -327,7 +341,8 @@ class ImageLoader:
                 self._cache.popitem(last=False)
 
     def shutdown(self):
-        self._executor.shutdown(wait=False, cancel_futures=True)
+        for _ in self._workers:
+            self._tasks.put(None)
 
 
 # ---------------------------------------------------------------------------
@@ -368,6 +383,8 @@ class ViewerApp:
         self.show_help = False
         self._photo = None          # keep a reference or tk drops the image
         self._resize_job = None
+        self._flash_text = None
+        self._flash_job = None
 
         root.title(f"PhotoViewer — {self.directory}")
         sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
@@ -561,7 +578,7 @@ class ViewerApp:
                                justify="left")
         self.update_status()
 
-    def update_status(self, extra=None):
+    def update_status(self):
         current = self.current_file()
         nfav = len(self.store.favorites)
         view_label = FILTER_LABELS[self.filter_mode]
@@ -573,12 +590,23 @@ class ViewerApp:
             text = (f"{current.name}   {self.index + 1} / {len(self.view)}"
                     f"   {star}   View: {view_label}"
                     f"   ★ {nfav} favorites   (h for help)")
-        if extra:
-            text = f"{extra}   |   {text}"
+        if self._flash_text:
+            text = f"{self._flash_text}   |   {text}"
         self.status.config(text=text)
 
     def flash(self, message):
-        self.update_status(extra=message)
+        # Kept as state (not a one-off config call) so a render() in the same
+        # event callback can't overwrite it before Tk paints; cleared on a timer.
+        if self._flash_job is not None:
+            self.root.after_cancel(self._flash_job)
+        self._flash_text = message
+        self._flash_job = self.root.after(2000, self._clear_flash)
+        self.update_status()
+
+    def _clear_flash(self):
+        self._flash_text = None
+        self._flash_job = None
+        self.update_status()
 
     def on_resize(self, event):
         if self._resize_job is not None:

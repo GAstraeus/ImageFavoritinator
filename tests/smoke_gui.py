@@ -60,6 +60,8 @@ def main():
     app.step(1)
     assert app.current_file().name == "IMG_3.jpg"
     app.toggle_favorite()
+    # The confirmation flash must survive the render() in the same callback.
+    assert "Favorited" in app.status.cget("text"), app.status.cget("text")
     app.jump(0)
     app.toggle_favorite()
     assert store.favorites == {"IMG_1.jpg", "IMG_3.jpg"}
