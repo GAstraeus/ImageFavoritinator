@@ -9,9 +9,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from PIL import Image
+
 from photo_viewer import (
+    BROWSE_TIER,
+    FULL_TIER,
     FavoritesStore,
     apply_filter,
+    clamp,
+    decode_image,
     natural_key,
     pick_view_index,
     rel_name,
@@ -141,6 +147,36 @@ class TestFiltering(unittest.TestCase):
         view = apply_filter(self.files, self.favs, "fav", self.dir)
         # current IMG_1 is before every favorite -> land on first
         self.assertEqual(pick_view_index(view, self.files, self.files[0]), 0)
+
+
+class TestDecode(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        self.path = self.dir / "big.jpg"
+        Image.new("RGB", (3000, 2000), "#336699").save(self.path, quality=90)
+
+    def test_full_tier_keeps_every_pixel(self):
+        decoded = decode_image(self.path, 0)
+        self.assertEqual(decoded.image.size, (3000, 2000))
+        self.assertEqual(decoded.orig_size, (3000, 2000))
+        self.assertEqual(decoded.tier, FULL_TIER)
+
+    def test_browse_tier_caps_but_reports_the_original_size(self):
+        decoded = decode_image(self.path, 1200)
+        self.assertEqual(max(decoded.image.size), 1200)
+        self.assertEqual(decoded.orig_size, (3000, 2000))
+        self.assertEqual(decoded.tier, BROWSE_TIER)
+
+    def test_cap_above_the_image_does_not_upscale(self):
+        decoded = decode_image(self.path, 9000)
+        self.assertEqual(decoded.image.size, (3000, 2000))
+
+    def test_clamp(self):
+        self.assertEqual(clamp(5, 0, 10), 5)
+        self.assertEqual(clamp(-1, 0, 10), 0)
+        self.assertEqual(clamp(11, 0, 10), 10)
 
 
 if __name__ == "__main__":
