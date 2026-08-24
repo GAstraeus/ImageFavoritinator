@@ -390,8 +390,11 @@ class ImageLoader:
 
     def __init__(self, browse_side=FALLBACK_BROWSE_SIDE,
                  browse_cache=BROWSE_CACHE_SIZE, full_cache=FULL_CACHE_SIZE,
-                 workers=2, is_relevant=None):
+                 workers=2, is_relevant=None, decoder=None):
         self.browse_side = browse_side
+        # Swappable so the native backend can decode with macOS ImageIO while
+        # reusing this threading, priority, and caching machinery.
+        self.decoder = decoder or decode_image
         self.is_relevant = is_relevant or (lambda path, tier: True)
         self.results = queue.Queue()
         self._caches = {BROWSE_TIER: OrderedDict(), FULL_TIER: OrderedDict()}
@@ -441,7 +444,7 @@ class ImageLoader:
                 return  # stale request; skip the expensive decode
             try:
                 max_side = self.browse_side if tier == BROWSE_TIER else 0
-                self.results.put((key, decode_image(path, max_side), None))
+                self.results.put((key, self.decoder(path, max_side), None))
             except Exception as exc:
                 self.results.put((key, None, str(exc)))
         finally:
