@@ -208,9 +208,16 @@ def test_native_viewer():
         viewer.zoom_by(0.01)
         assert viewer.magnification is None, viewer.magnification
 
-        # Interpolation is honest: no smoothing once we are magnifying.
-        assert native_viewer.interpolation_for(3.0) == Quartz.kCGInterpolationNone
+        # Magnifying stays smooth like Preview unless you ask for hard pixels.
+        assert native_viewer.interpolation_for(3.0) == Quartz.kCGInterpolationHigh
         assert native_viewer.interpolation_for(0.4) == Quartz.kCGInterpolationHigh
+        assert not viewer.pixel_peep
+        viewer.canvas.keyDown_(key_event("p"))
+        assert viewer.pixel_peep
+        assert native_viewer.interpolation_for(
+            3.0, viewer.pixel_peep) == Quartz.kCGInterpolationNone
+        viewer.canvas.keyDown_(key_event("p"))
+        assert not viewer.pixel_peep
 
         # Keys: favorite, filter, and the star overlay following along.
         viewer.canvas.keyDown_(key_event(" "))

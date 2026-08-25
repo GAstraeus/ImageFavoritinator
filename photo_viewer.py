@@ -5,7 +5,11 @@ photo_viewer.py — fast keyboard-driven culling tool for Canon CR3 raw images
 
 Usage:
     python3 photo_viewer.py /path/to/images
-    python3 photo_viewer.py /path/to/images --native   # crisp Retina backend
+    python3 photo_viewer.py /path/to/images --quicklook   # Apple's renderer
+    python3 photo_viewer.py /path/to/images --tk          # portable fallback
+
+On macOS the pixel-exact --native backend is chosen automatically when PyObjC
+is installed, because it is the only one that can use a Retina panel fully.
 
 Keys:
     Right / Down        next image
@@ -17,6 +21,7 @@ Keys:
     + / -               zoom in / out
     scroll wheel        zoom at the pointer
     drag                pan when zoomed in
+    P                   smooth zoom (like Preview) <-> hard pixels
     O                   open the current image in Preview.app
     Home / End          jump to first / last image in the current view
     E                   export favorites.txt and non_favorites.txt
@@ -34,12 +39,13 @@ on a photo, so zooming shows real pixels rather than an upscaled preview.
 CR3 decoding uses the embedded full-size JPEG preview via rawpy (pip install
 rawpy) when available, and falls back to macOS's built-in `sips`, which needs
 nothing installed. Run --probe FILE.CR3 to see exactly what each path yields.
+That embedded JPEG is fast and already sharpened, but it carries compression
+blocks that show under heavy zoom; --raw-develop develops the sensor instead.
 
 Note on sharpness: tkinter draws one image pixel per *point*, so on a Retina
-display it cannot use the panel's full pixel grid — a fit-to-window photo is
-drawn at half the panel's resolution. Use --native (pip install
-pyobjc-framework-Quartz) for a pixel-exact Retina viewer with Preview-style
-pinch/scroll zoom, or press O to open the current shot in Preview.app.
+display it cannot use the panel's full pixel grid — "100%" is really 200% on a
+2x panel, with every image pixel drawn as a hard 2x2 block. That is why
+--native is the default on macOS; --tk forces this backend anyway.
 """
 
 import argparse
@@ -172,6 +178,21 @@ def clamp(value, low, high):
     return low if value < low else (high if value > high else value)
 
 
+def resample_for(ratio, pixel_peep=False):
+    """Pick a Pillow resampling filter, matching Preview.app by default.
+
+    `ratio` is output pixels per source pixel, so below 1.0 we are shrinking.
+    Preview smooths whenever it magnifies; nearest-neighbour draws hard blocks,
+    which reads as "pixelated" even when no detail is missing at all. So smooth
+    is the default, and nearest stays reachable on the P key for judging focus.
+    """
+    if ratio < 1.0:
+        return Image.Resampling.LANCZOS       # downscale: keep it sharp
+    if pixel_peep:
+        return Image.Resampling.NEAREST       # show the actual pixels
+    return Image.Resampling.BICUBIC
+
+
 class FavoritesStore:
     """Favorite filenames, persisted as JSON next to the images.
 
@@ -244,12 +265,38 @@ def _apply_libraw_flip(img, flip):
     return img
 
 
-def _decode_raw_rawpy(path, want_full):
+def native_available():
+    """True when the macOS backends can run (PyObjC present)."""
+    if sys.platform != "darwin":
+        return False
+    try:
+        import AppKit            # noqa: F401
+        import objc              # noqa: F401
+        import Quartz            # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def raw_develop_decoder():
+    """A decoder that develops sensor data rather than reusing camera JPEGs.
+
+    The embedded JPEG is what makes browsing fast, so it still serves the
+    browse tier; only the full-resolution tier pays for a demosaic.
+    """
+    def decode(path, max_side=0):
+        return decode_image(path, max_side, raw_develop=True)
+    return decode
+
+
+def _decode_raw_rawpy(path, want_full, develop=False):
     """Decode a raw file with rawpy/LibRaw.
 
     Prefers the embedded full-size JPEG preview (fast, and what the camera
     itself shows). Falls back to demosaicing the sensor data when that preview
-    is missing or is too small to count as full resolution.
+    is missing, is too small to count as full resolution, or when `develop`
+    asks for real sensor data because the JPEG's compression artifacts show up
+    under heavy zoom.
     """
     with rawpy.imread(str(path)) as raw:
         sizes = raw.sizes
@@ -282,7 +329,7 @@ def _decode_raw_rawpy(path, want_full):
             # Canon embeds a full-size JPEG in CR3, so this is normally an
             # exact match; anything close enough is treated as full res.
             is_full_size = max(preview.size) >= 0.9 * longest
-            if is_full_size:
+            if is_full_size and not (want_full and develop):
                 return preview, (max(preview.width, full_w),
                                  max(preview.height, full_h))
             if not want_full:
@@ -324,7 +371,7 @@ def _decode_raw_sips(path, max_side):
             pass
 
 
-def decode_image(path, max_side=0):
+def decode_image(path, max_side=0, raw_develop=False):
     """Decode any supported image.
 
     max_side caps the longest edge (0 or None means full resolution).
@@ -337,7 +384,8 @@ def decode_image(path, max_side=0):
 
     if ext in RAW_EXTS:
         if HAVE_RAWPY:
-            img, orig_size = _decode_raw_rawpy(path, want_full)
+            img, orig_size = _decode_raw_rawpy(path, want_full,
+                                               develop=raw_develop)
         elif sys.platform == "darwin":
             img = _decode_raw_sips(path, max_side)
             # Only the capped tier needs to ask how big the original was.
@@ -489,6 +537,7 @@ Space or F        toggle favorite
 0                 zoom to fit          9   zoom to 100%
 + / -             zoom in / out        scroll wheel  zoom at pointer
 drag              pan when zoomed in
+P                 smooth zoom (like Preview) <-> hard pixels
 O                 open in Preview.app (true full-res pixels)
 Home / End        first / last image
 E                 export favorites.txt / non_favorites.txt
@@ -516,6 +565,9 @@ class ViewerApp:
         self.index = 0
         self.direction = 1
         self.show_help = False
+        # Off by default so magnifying looks like Preview (smooth). On, it
+        # switches to nearest-neighbour so you can judge focus on real pixels.
+        self.pixel_peep = False
         self.zoom = None            # None = fit to window, else image px/point
         self.center = (0.5, 0.5)    # normalized image point at canvas centre
         self.save_warning = None    # persistent banner when saving fails
@@ -558,6 +610,8 @@ class ViewerApp:
         root.bind("h", lambda e: self.toggle_help())
         root.bind("H", lambda e: self.toggle_help())
         root.bind("?", lambda e: self.toggle_help())
+        root.bind("p", lambda e: self.toggle_pixel_peep())
+        root.bind("P", lambda e: self.toggle_pixel_peep())
         root.bind("o", lambda e: self.open_in_preview())
         root.bind("O", lambda e: self.open_in_preview())
         root.bind("<Command-o>", lambda e: self.open_in_preview())
@@ -887,13 +941,8 @@ class ViewerApp:
         box = (x0, y0, x1, y1)
 
         ratio = out_w / max(1e-9, box[2] - box[0])   # output px per source px
-        if ratio < 1.0:
-            resample = Image.Resampling.LANCZOS     # downscale: keep it sharp
-        elif ratio < 2.0:
-            resample = Image.Resampling.BICUBIC
-        else:
-            resample = Image.Resampling.NEAREST     # show the actual pixels
-        rendered = source.image.resize((out_w, out_h), resample, box=box)
+        rendered = source.image.resize(
+            (out_w, out_h), resample_for(ratio, self.pixel_peep), box=box)
 
         # Feed Tk a PPM directly instead of using PIL.ImageTk, which breaks
         # when Pillow and Tk were built against different Tcl/Tk.
@@ -932,6 +981,8 @@ class ViewerApp:
                 parts += [f"{ow}×{oh}", label]
             if getattr(self, "_detail_note", ""):
                 parts.append(self._detail_note)
+            if self.pixel_peep:
+                parts.append("hard pixels")
             parts += [f"View: {view_label}", f"★ {nfav} favorites",
                       "(h for help)"]
             text = "   ".join(parts)
@@ -967,6 +1018,12 @@ class ViewerApp:
 
     def toggle_help(self):
         self.show_help = not self.show_help
+        self.render()
+
+    def toggle_pixel_peep(self):
+        self.pixel_peep = not self.pixel_peep
+        self.flash("Pixel peeping: hard pixels" if self.pixel_peep
+                   else "Smooth zoom (like Preview)")
         self.render()
 
     def on_escape(self, event=None):
@@ -1020,18 +1077,38 @@ def probe(path, browse_side=FALLBACK_BROWSE_SIDE):
             except Exception as exc:
                 print(f"embedded preview: none ({exc})")
 
-    for label, max_side in (("browse tier", browse_side), ("full tier", 0)):
+    tiers = (("browse tier", browse_side, False),
+             ("full tier", 0, False),
+             ("full, developed", 0, True))
+    for label, max_side, develop in tiers:
+        if develop and (path.suffix.lower() not in RAW_EXTS or not HAVE_RAWPY):
+            continue
         start = time.perf_counter()
         try:
-            decoded = decode_image(path, max_side)
+            decoded = decode_image(path, max_side, raw_develop=develop)
         except Exception as exc:
-            print(f"{label:<12} FAILED: {exc}")
+            print(f"{label:<16} FAILED: {exc}")
             continue
         elapsed = time.perf_counter() - start
         megapixels = decoded.image.width * decoded.image.height / 1e6
-        print(f"{label:<12} {decoded.image.width}×{decoded.image.height} "
+        print(f"{label:<16} {decoded.image.width}×{decoded.image.height} "
               f"({megapixels:.1f} MP) in {elapsed:.2f}s   "
               f"original {decoded.orig_size[0]}×{decoded.orig_size[1]}")
+
+    if path.suffix.lower() in RAW_EXTS and HAVE_RAWPY:
+        print("\nIf 'full tier' matches the embedded preview size above, the "
+              "full-resolution\nview is the JPEG your camera wrote, not the "
+              "sensor data. That is fast and\nalready sharpened, but its "
+              "compression blocks show under heavy zoom — use\n--raw-develop "
+              "to develop the sensor instead, and compare.")
+
+    if sys.platform == "darwin":
+        print(f"\nmacOS backends available (PyObjC): "
+              f"{'yes' if native_available() else 'no'}")
+        if not native_available():
+            print("  Without it the viewer falls back to tkinter, which cannot "
+                  "address Retina\n  pixels. Install: python3 -m pip install "
+                  "pyobjc-framework-Quartz")
     return 0
 
 
@@ -1046,10 +1123,26 @@ def build_parser():
         epilog=HELP_TEXT)
     parser.add_argument("directory", nargs="?",
                         help="directory containing the images")
-    parser.add_argument("--native", action="store_true",
-                        help="use the native macOS backend: pixel-exact on "
-                             "Retina, pinch/scroll zoom (needs "
-                             "pyobjc-framework-Quartz)")
+    backend = parser.add_mutually_exclusive_group()
+    backend.add_argument("--native", dest="backend", action="store_const",
+                         const="native",
+                         help="native macOS backend: pixel-exact on Retina, "
+                              "pinch/scroll zoom (the default on macOS when "
+                              "pyobjc-framework-Quartz is installed)")
+    backend.add_argument("--quicklook", dest="backend", action="store_const",
+                         const="quicklook",
+                         help="render with Apple's Quick Look view (the engine "
+                              "Finder's spacebar preview uses) instead of ours")
+    backend.add_argument("--tk", dest="backend", action="store_const",
+                         const="tk",
+                         help="force the portable tkinter backend; note Tk "
+                              "cannot address Retina pixels, so a 2x display "
+                              "shows at most half the detail")
+    parser.set_defaults(backend=None)
+    parser.add_argument("--raw-develop", action="store_true",
+                        help="develop raw sensor data for the full-resolution "
+                             "tier instead of using the full-size JPEG the "
+                             "camera embedded (slower; no JPEG artifacts)")
     parser.add_argument("--filter", choices=("all", "fav", "unfav"),
                         default="all", help="initial view filter")
     parser.add_argument("--recursive", action="store_true",
@@ -1097,10 +1190,31 @@ def main(argv=None):
         sys.exit(f"No images found in {directory} "
                  f"(looked for: {', '.join(sorted(ALL_EXTS))})")
 
-    if args.native:
+    backend = args.backend or ("native" if native_available() else "tk")
+
+    if backend in ("native", "quicklook"):
+        if not native_available():
+            sys.exit(f"--{backend} needs PyObjC on macOS. Install it with:\n"
+                     "    python3 -m pip install pyobjc-framework-Quartz\n"
+                     "Or use --tk for the portable viewer.")
+        if backend == "quicklook":
+            import quicklook_viewer
+            return quicklook_viewer.run(directory, files, store,
+                                        initial_filter=args.filter)
         import native_viewer
         return native_viewer.run(directory, files, store,
-                                 initial_filter=args.filter)
+                                 initial_filter=args.filter,
+                                 raw_develop=args.raw_develop)
+
+    if sys.platform == "darwin" and args.backend is None:
+        # Landing here on a Mac means PyObjC is missing, and Tk cannot address
+        # Retina pixels: it draws one image pixel per *point*, so on a 2x panel
+        # even a full-resolution photo is drawn at half the detail the screen
+        # can show. Worth saying plainly rather than letting it look soft.
+        print("Note: falling back to the tkinter viewer, which cannot use all "
+              "the pixels of a Retina display.\nFor full sharpness: "
+              "python3 -m pip install pyobjc-framework-Quartz",
+              file=sys.stderr)
 
     if not HAVE_RAWPY and any(p.suffix.lower() in RAW_EXTS for p in files):
         if sys.platform == "darwin":
@@ -1121,7 +1235,9 @@ def main(argv=None):
         browse_side = max(2048, int(screen_max * 1.3))
     else:
         browse_side = args.max_side
-    loader = ImageLoader(browse_side=browse_side)
+    loader = ImageLoader(browse_side=browse_side,
+                         decoder=raw_develop_decoder() if args.raw_develop
+                         else None)
     ViewerApp(root, directory, files, store, loader,
               initial_filter=args.filter)
     root.lift()

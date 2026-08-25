@@ -11,13 +11,17 @@ the lists.
 python3 -m pip install pillow rawpy pyobjc-framework-Quartz
 ```
 
-Only `pillow` is strictly required:
+On a Retina Mac, install `pyobjc-framework-Quartz` — it is what makes the viewer
+sharp, and it becomes the default backend once present. The others are optional:
 
+- `pyobjc-framework-Quartz` enables `--native` (and `--quicklook`). Without it
+  you get the tkinter viewer, which **cannot address Retina pixels** — see
+  "If it still looks pixelated" below.
+- `pillow` is required for the tkinter backend; `--native` does not need it for
+  decoding.
 - `rawpy` gives fast CR3 decoding by reading the JPEG preview embedded in each
-  raw file. Without it the viewer falls back to macOS's built-in `sips`, which
-  works with nothing installed but is slower per image.
-- `pyobjc-framework-Quartz` enables `--native`, which is the sharpest option on
-  a Retina display (see below).
+  raw file. `--native` decodes CR3 through macOS itself and doesn't need rawpy
+  at all. Without either, the tkinter viewer falls back to macOS's `sips`.
 
 If Python complains that `tkinter` is missing (Homebrew Python), run
 `brew install python-tk`.
@@ -25,9 +29,12 @@ If Python complains that `tkinter` is missing (Homebrew Python), run
 ## Usage
 
 ```bash
-python3 photo_viewer.py /path/to/your/cr3/folder            # tkinter viewer
-python3 photo_viewer.py /path/to/your/cr3/folder --native    # sharpest on Retina
+python3 photo_viewer.py /path/to/your/cr3/folder
 ```
+
+On macOS that picks the **native** backend automatically when PyObjC is
+installed, because it is the only one that can use every pixel of a Retina
+display. Override with `--native`, `--quicklook`, or `--tk`.
 
 | Key | Action |
 | --- | --- |
@@ -44,6 +51,7 @@ python3 photo_viewer.py /path/to/your/cr3/folder --native    # sharpest on Retin
 | drag | pan when zoomed in (`--native`: two-finger scroll) |
 | pinch | zoom (`--native` only) |
 | double-click | toggle fit ↔ 100% |
+| `P` | smooth zoom (like Preview) ↔ hard pixels |
 | `Home` / `End` | first / last image |
 | `O` | open the current image in Preview.app |
 | `E` | export `favorites.txt` and `non_favorites.txt` |
@@ -72,8 +80,24 @@ instead of an upscaled preview. The status bar tells you which one you are
 looking at (`preview` / `full res`) alongside the true pixel dimensions and the
 current zoom percentage. Rendering crops to the visible region *before*
 resizing, so zooming into a 45 MP frame never costs more than a screenful of
-work, and past 2× it switches to nearest-neighbour — if you are pixel-peeping,
-you should see the actual pixels rather than a smoothed guess.
+work.
+
+### If it still looks pixelated
+
+`full res` in the status bar describes the **data**, not the rendering. Three
+separate things can still make a full-resolution image look blocky:
+
+1. **You are on the tkinter backend.** Tk draws one image pixel per *point*, so
+   on a 2× Retina display "100%" is really 200% on the panel — every image pixel
+   becomes a hard 2×2 block. Nothing in the drawing code can fix this; use
+   `--native` (now the default when PyObjC is installed).
+2. **Hard-pixel mode is on.** Press `P` to go back to smooth. Smooth is the
+   default and matches Preview.app; hard pixels are for judging focus.
+3. **On a raw file, "full res" may be the JPEG your camera embedded.** Canon
+   writes a full-size JPEG into every CR3 and we use it because it is fast and
+   already sharpened — but it carries JPEG compression blocks that show up
+   under heavy zoom. `--raw-develop` develops the sensor data instead. Run
+   `--probe FILE.CR3` to see which one you are getting and what it costs.
 
 ### Why `--native` looks sharper
 
@@ -94,6 +118,26 @@ Preview.app uses:
 Because the image is laid out in points (pixels ÷ backing scale factor), 100%
 zoom puts exactly one image pixel on one device pixel. That is as sharp as the
 display can physically be.
+
+### Piggybacking on Apple's viewer
+
+You cannot drive Preview.app itself — nothing reports which image it is showing
+and there is no way to hook its keys, so favoriting would have nothing to attach
+to. But you *can* embed Apple's renderer:
+
+```bash
+python3 photo_viewer.py /photos --quicklook
+```
+
+`--quicklook` puts `QLPreviewView` — the same view behind Finder's spacebar
+preview — inside our window, so the image area is entirely Apple's code while
+the keys, favorites, filters, and status bar stay ours. Its zoom and scroll
+belong to Quick Look, and we hand its `displayState` across navigation so your
+zoom usually carries over.
+
+It is not the default because Quick Look does its own loading: there is no
+two-tier prefetch, so holding the arrow key down is less instant than
+`--native`. Use it to compare Apple's rendering against ours on your own files.
 
 Either way, `O` hands the current file straight to Preview.app if you want a
 second opinion.
@@ -130,7 +174,13 @@ done
 ## Other options
 
 ```
---native                   pixel-exact macOS backend with pinch zoom
+--native                   pixel-exact macOS backend with pinch zoom (default
+                           on macOS when PyObjC is installed)
+--quicklook                render with Apple's Quick Look view
+--tk                       force the portable tkinter backend
+--raw-develop              develop raw sensor data for the full tier instead of
+                           reusing the camera's embedded JPEG (slower, no
+                           compression artifacts)
 --filter {all,fav,unfav}   initial view filter
 --recursive                include images in subfolders
 --max-side N               longest edge of the browse preview (default: sized
@@ -153,9 +203,10 @@ python3 photo_viewer.py --probe /photos/IMG_0001.CR3
 python3 -m unittest discover -s tests -q   # logic + geometry, no GUI
 python3 tests/smoke_gui.py                 # drives the real tkinter window
 python3 tests/smoke_native.py              # drives the real AppKit window
+python3 tests/smoke_quicklook.py           # drives the real Quick Look view
 ```
 
-The two smoke tests open a window briefly. `smoke_native.py` skips itself if
+The smoke tests open a window briefly. The two macOS ones skip themselves if
 PyObjC isn't installed. `smoke_gui.py` runs each of its cases in a separate
 process, because a second Tk root in one process never gets its geometry
 processed on macOS while withdrawn.

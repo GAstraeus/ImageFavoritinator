@@ -88,14 +88,30 @@ class TestNativeGeometry(unittest.TestCase):
             native_viewer.center_for_rect(((0, 0), (10, 10)), (0, 0)),
             (0.5, 0.5))
 
-    def test_interpolation_stops_smoothing_once_magnifying(self):
+    def test_zoom_is_smooth_by_default_like_preview(self):
+        """The regression this guards: nearest-neighbour reads as pixelated.
+
+        Blocky nearest-neighbour past 2x was the old default, and it looked
+        pixelated even though no detail was missing. Preview.app smooths at
+        every zoom level, so we do too.
+        """
         import Quartz
-        self.assertEqual(native_viewer.interpolation_for(0.4),
-                         Quartz.kCGInterpolationHigh)
-        self.assertEqual(native_viewer.interpolation_for(1.5),
-                         Quartz.kCGInterpolationDefault)
-        self.assertEqual(native_viewer.interpolation_for(2.0),
-                         Quartz.kCGInterpolationNone)
+        for magnification in (0.4, 1.0, 1.5, 2.0, 4.0, 8.0):
+            self.assertEqual(native_viewer.interpolation_for(magnification),
+                             Quartz.kCGInterpolationHigh, magnification)
+
+    def test_pixel_peeping_shows_hard_pixels_only_when_magnifying(self):
+        import Quartz
+        self.assertEqual(
+            native_viewer.interpolation_for(3.0, pixel_peep=True),
+            Quartz.kCGInterpolationNone)
+        # Downscaling with nearest would alias badly, so it stays smooth.
+        self.assertEqual(
+            native_viewer.interpolation_for(0.5, pixel_peep=True),
+            Quartz.kCGInterpolationHigh)
+        self.assertEqual(
+            native_viewer.interpolation_for(1.0, pixel_peep=True),
+            Quartz.kCGInterpolationHigh)
 
     def test_symbols_are_bound_eagerly_for_thread_safety(self):
         # PyObjC's lazy symbol lookup is not thread-safe (it ends in a dict

@@ -4,7 +4,8 @@ pillow>=10.0
 # Without it, the viewer falls back to macOS's built-in `sips` (slower).
 rawpy>=0.19
 
-# Optional: enables --native, the pixel-exact macOS backend (Apple's ImageIO
-# decoder plus real pinch/scroll zoom). Sharper than tkinter on a Retina
-# display, and decodes CR3 without rawpy.
+# Install this on a Mac. It enables --native (the default backend when present:
+# Apple's ImageIO decoder plus real pinch/scroll zoom) and --quicklook. tkinter
+# can only address points, not Retina pixels, so without this the viewer is
+# permanently half as sharp as the display allows. Also decodes CR3 sans rawpy.
 pyobjc-framework-Quartz>=9.0

@@ -1,16 +1,20 @@
 """Unit tests for the non-GUI logic in photo_viewer.py."""
 
+import contextlib
+import io
 import json
 import os
 import sys
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from PIL import Image
 
+import photo_viewer
 from photo_viewer import (
     BROWSE_TIER,
     FULL_TIER,
@@ -21,6 +25,7 @@ from photo_viewer import (
     natural_key,
     pick_view_index,
     rel_name,
+    resample_for,
     scan_images,
 )
 
@@ -173,10 +178,69 @@ class TestDecode(unittest.TestCase):
         decoded = decode_image(self.path, 9000)
         self.assertEqual(decoded.image.size, (3000, 2000))
 
+    def test_raw_develop_is_a_no_op_for_non_raw_files(self):
+        """--raw-develop must not disturb JPEGs, only raw sensor files."""
+        plain = decode_image(self.path, 0)
+        developed = photo_viewer.raw_develop_decoder()(self.path, 0)
+        self.assertEqual(developed.image.size, plain.image.size)
+        self.assertEqual(developed.orig_size, plain.orig_size)
+        self.assertEqual(developed.tier, FULL_TIER)
+
     def test_clamp(self):
         self.assertEqual(clamp(5, 0, 10), 5)
         self.assertEqual(clamp(-1, 0, 10), 0)
         self.assertEqual(clamp(11, 0, 10), 10)
+
+
+class TestResampling(unittest.TestCase):
+    """The tkinter half of the "why does it still look pixelated" fix."""
+
+    def test_magnifying_is_smooth_by_default_like_preview(self):
+        for ratio in (1.0, 1.5, 2.0, 4.0, 8.0):
+            self.assertEqual(resample_for(ratio),
+                             Image.Resampling.BICUBIC, ratio)
+
+    def test_pixel_peeping_shows_hard_pixels_when_magnifying(self):
+        for ratio in (1.0, 2.0, 8.0):
+            self.assertEqual(resample_for(ratio, pixel_peep=True),
+                             Image.Resampling.NEAREST, ratio)
+
+    def test_downscaling_always_uses_lanczos(self):
+        # Nearest on a downscale would alias, so P must not reach this case.
+        for peep in (False, True):
+            for ratio in (0.1, 0.5, 0.99):
+                self.assertEqual(resample_for(ratio, pixel_peep=peep),
+                                 Image.Resampling.LANCZOS, (ratio, peep))
+
+
+class TestBackendSelection(unittest.TestCase):
+    def test_native_is_the_default_on_macos_when_pyobjc_is_present(self):
+        # Forgetting a flag was how the Retina-softness trap got hit, so the
+        # sharp backend has to be what you get without asking.
+        args = photo_viewer.build_parser().parse_args(["/tmp"])
+        self.assertIsNone(args.backend)
+        expected = "native" if photo_viewer.native_available() else "tk"
+        self.assertEqual(args.backend or expected, expected)
+
+    def test_backends_are_mutually_exclusive(self):
+        parser = photo_viewer.build_parser()
+        for pair in (["--native", "--tk"], ["--quicklook", "--native"],
+                     ["--tk", "--quicklook"]):
+            with self.assertRaises(SystemExit), \
+                    contextlib.redirect_stderr(io.StringIO()):
+                parser.parse_args(pair + ["/tmp"])
+
+    def test_each_backend_flag_selects_itself(self):
+        parser = photo_viewer.build_parser()
+        for flag, expected in (("--native", "native"),
+                               ("--quicklook", "quicklook"),
+                               ("--tk", "tk")):
+            self.assertEqual(
+                parser.parse_args([flag, "/tmp"]).backend, expected)
+
+    def test_native_available_is_false_off_darwin(self):
+        with unittest.mock.patch.object(photo_viewer.sys, "platform", "linux"):
+            self.assertFalse(photo_viewer.native_available())
 
 
 if __name__ == "__main__":

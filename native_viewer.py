@@ -102,6 +102,15 @@ kCGInterpolationDefault = Quartz.kCGInterpolationDefault
 kCGInterpolationHigh = Quartz.kCGInterpolationHigh
 kCGInterpolationNone = Quartz.kCGInterpolationNone
 
+# Apple's RAW developing pipeline, used only for --raw-develop. Looked up here
+# (main thread, import time) for the same thread-safety reason as above, and
+# tolerated as missing so an older macOS still runs everything else.
+try:
+    CIRAWFilter = objc.lookUpClass("CIRAWFilter")
+    CIContext = objc.lookUpClass("CIContext")
+except objc.error:                                          # pragma: no cover
+    CIRAWFilter = CIContext = None
+
 from photo_viewer import (
     BROWSE_TIER,
     FULL_CACHE_SIZE,
@@ -111,6 +120,7 @@ from photo_viewer import (
     MIN_ZOOM,
     PREFETCH_AHEAD,
     PREFETCH_BEHIND,
+    RAW_EXTS,
     RELEVANCE_WINDOW,
     Decoded,
     FILTER_LABELS,
@@ -138,6 +148,7 @@ Space or F        toggle favorite
 pinch             zoom, like Preview
 two-finger scroll pan       Cmd/Opt-scroll  zoom at the pointer
 double-tap        smart zoom
+P                 smooth zoom (like Preview) <-> hard pixels
 Home / End        first / last image
 E                 export favorites.txt / non_favorites.txt
 G                 toggle fullscreen
@@ -200,6 +211,44 @@ def decode_native(path, max_side=0):
                        BROWSE_TIER if max_side else FULL_TIER)
 
 
+def decode_native_develop(path, max_side=0):
+    """Like decode_native, but develops raw sensor data for the full tier.
+
+    ImageIO may hand back the full-size JPEG the camera embedded in a raw file
+    rather than developing the sensor data. That JPEG is fast and already
+    sharpened, but its 8x8 compression blocks become visible under heavy zoom.
+    CIRAWFilter is Apple's actual raw pipeline, so this trades speed for pixels
+    with no compression history.
+
+    Only the full tier pays the cost: browsing still uses the embedded preview.
+    Falls back to decode_native for non-raw files and on any failure, so a
+    camera Core Image doesn't know can never break a culling session.
+    """
+    if max_side or CIRAWFilter is None or \
+            Path(path).suffix.lower() not in RAW_EXTS:
+        return decode_native(path, max_side)
+
+    try:
+        with objc.autorelease_pool():
+            url = NSURL.fileURLWithPath_(str(path))
+            raw_filter = CIRAWFilter.alloc().initWithImageURL_(url)
+            if raw_filter is None:
+                return decode_native(path, max_side)
+            ci_image = raw_filter.outputImage()
+            if ci_image is None:
+                return decode_native(path, max_side)
+            extent = ci_image.extent()
+            image = CIContext.context().createCGImage_fromRect_(ci_image,
+                                                               extent)
+            if image is None:
+                return decode_native(path, max_side)
+            return Decoded(image,
+                           (CGImageGetWidth(image), CGImageGetHeight(image)),
+                           FULL_TIER)
+    except Exception:
+        return decode_native(path, max_side)
+
+
 # ---------------------------------------------------------------------------
 # Pure geometry (no AppKit calls, so it is unit-testable)
 # ---------------------------------------------------------------------------
@@ -249,13 +298,18 @@ def center_for_rect(visible_rect, doc_size):
             clamp((y + h / 2) / dh, 0.0, 1.0))
 
 
-def interpolation_for(magnification):
-    """At 2x and beyond, show the real pixels instead of smoothing them."""
-    if magnification >= 2.0:
+def interpolation_for(magnification, pixel_peep=False):
+    """Pick a resampling filter, matching Preview.app by default.
+
+    Preview smooths at every zoom level. Nearest-neighbour past 2x -- which is
+    what this used to do -- shows hard blocky pixels, so it reads as
+    "pixelated" even when no detail is missing at all. Smoothing is therefore
+    the default. Nearest is still the honest choice for judging focus at the
+    pixel level, so it stays reachable on the P key.
+    """
+    if pixel_peep and magnification > 1.0:
         return kCGInterpolationNone
-    if magnification < 1.0:
-        return kCGInterpolationHigh
-    return kCGInterpolationDefault
+    return kCGInterpolationHigh
 
 
 # ---------------------------------------------------------------------------
@@ -310,8 +364,10 @@ class ImageCanvas(NSView):
         if self.source is not None:
             scroll = self.enclosingScrollView()
             magnification = scroll.magnification() if scroll else 1.0
-            CGContextSetInterpolationQuality(ctx,
-                                             interpolation_for(magnification))
+            controller = self.controller
+            peep = controller.pixel_peep if controller is not None else False
+            CGContextSetInterpolationQuality(
+                ctx, interpolation_for(magnification, peep))
             # Draw the whole image into bounds and let CoreGraphics clip to
             # the dirty rect: it rasterises tile-wise, so a 45 MP frame at 4x
             # only ever paints what is on screen.
@@ -420,6 +476,9 @@ class NativeViewer:
         self._detail_note = ""
         self.backing_scale = 1.0
         self.live_magnify = False
+        # Off by default so magnifying looks like Preview (smooth). On, it
+        # switches to nearest-neighbour so you can judge focus on real pixels.
+        self.pixel_peep = False
         # True while we are programmatically restoring zoom/position, so the
         # bounds-changed notifications that causes don't overwrite the
         # position we are in the middle of restoring.
@@ -837,6 +896,8 @@ class NativeViewer:
                 parts += [f"{ow}×{oh}", label]
             if self._detail_note:
                 parts.append(self._detail_note)
+            if self.pixel_peep:
+                parts.append("hard pixels")
             parts += [f"View: {view_label}", f"★ {nfav} favorites",
                       "(h for help)"]
             text = "   ".join(parts)
@@ -864,6 +925,13 @@ class NativeViewer:
 
     def toggle_help(self):
         self.show_help = not self.show_help
+        self.update_chrome()
+
+    def toggle_pixel_peep(self):
+        self.pixel_peep = not self.pixel_peep
+        self.canvas.setNeedsDisplay_(True)
+        self.flash("Pixel peeping: hard pixels" if self.pixel_peep
+                   else "Smooth zoom (like Preview)")
         self.update_chrome()
 
     # -- keys ---------------------------------------------------------------
@@ -901,6 +969,8 @@ class NativeViewer:
             self.zoom_by(ZOOM_STEP)
         elif char in ("-", "_"):
             self.zoom_by(1 / ZOOM_STEP)
+        elif char == "p":
+            self.toggle_pixel_peep()
         elif char == "e":
             self.export_lists()
         elif char == "g":
@@ -935,7 +1005,8 @@ class NativeViewer:
         NSApp().terminate_(None)
 
 
-def run(directory, files, store, initial_filter="all", browse_side=None):
+def run(directory, files, store, initial_filter="all", browse_side=None,
+        raw_develop=False):
     """Entry point used by photo_viewer.py --native."""
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyRegular)
@@ -949,7 +1020,8 @@ def run(directory, files, store, initial_filter="all", browse_side=None):
     loader = ImageLoader(browse_side=browse_side,
                          browse_cache=NATIVE_BROWSE_CACHE,
                          full_cache=FULL_CACHE_SIZE,
-                         decoder=decode_native)
+                         decoder=decode_native_develop if raw_develop
+                         else decode_native)
     # The controller outlives this local: it is reachable from the canvas
     # (canvas.controller), which AppKit retains as the scroll view's document
     # view, so the run loop's callbacks always find it.
